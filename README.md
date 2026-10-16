@@ -1,4 +1,4 @@
-# Pipeline Optimizer 2.0
+# CI-CD Pipeline Optimizer
 
 A full-stack React + Vite CI/CD monitoring dashboard backed by a small Node.js API and GitHub OAuth.
 
