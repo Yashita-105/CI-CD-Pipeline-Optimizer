@@ -94,10 +94,26 @@ function calculateAnalysis(runs) {
 }
 function recommendationsFrom(runs) {
   const analysis = calculateAnalysis(runs)
+  const completedRuns = runs.filter(run => run.status !== 'running')
+  const failedRuns = completedRuns.filter(run => run.conclusion === 'failure')
+  const slowestRuns = completedRuns
+    .filter(run => run.duration > 0)
+    .sort((a, b) => b.duration - a.duration)
+    .slice(0, 3)
+  const recentRuns = runs.slice(0, 3)
+  const evidence = (sampleRuns) => ({
+    runsAnalyzed: runs.length,
+    completedRuns: completedRuns.length,
+    failedRuns: failedRuns.length,
+    averageDuration: analysis.avgDuration,
+    sampleRuns: sampleRuns.map(({ id, number, name, branch, duration, status, time, url }) => ({
+      id, number, name, branch, duration, status, time, url
+    }))
+  })
   const recs = []
-  if (analysis.avgDuration > 10) recs.push({ id: 'duration', priority: 'High', type: 'Performance', title: 'Reduce overall workflow duration', stage: 'Workflow', reason: `Average execution is ${analysis.avgDuration} minutes across the fetched runs. Inspect the slowest jobs and introduce caching or parallel jobs.`, benefit: 'Lower feedback time for every pull request.' })
-  if (analysis.failures > 0) recs.push({ id: 'failures', priority: 'High', type: 'Reliability', title: 'Investigate recurring failed runs', stage: 'Workflow', reason: `${analysis.failures} completed runs failed in the selected history. Open the failed runs and inspect their jobs/logs.`, benefit: 'Higher delivery reliability and fewer reruns.' })
-  if (!recs.length) recs.push({ id: 'healthy', priority: 'Low', type: 'Optimization', title: 'Pipeline is currently healthy', stage: 'Workflow', reason: 'No major duration or reliability signal was detected in the fetched run history.', benefit: 'Keep monitoring for regressions as workload changes.' })
+  if (analysis.avgDuration > 10) recs.push({ id: 'duration', priority: 'High', type: 'Performance', title: 'Reduce overall workflow duration', stage: 'Workflow', reason: `Average execution is ${analysis.avgDuration} minutes across the fetched runs. Inspect the slowest jobs and introduce caching or parallel jobs.`, benefit: 'Lower feedback time for every pull request.', evidence: evidence(slowestRuns) })
+  if (analysis.failures > 0) recs.push({ id: 'failures', priority: 'High', type: 'Reliability', title: 'Investigate recurring failed runs', stage: 'Workflow', reason: `${analysis.failures} completed runs failed in the selected history. Open the failed runs and inspect their jobs/logs.`, benefit: 'Higher delivery reliability and fewer reruns.', evidence: evidence(failedRuns.slice(0, 3)) })
+  if (!recs.length) recs.push({ id: 'healthy', priority: 'Low', type: 'Optimization', title: 'Pipeline is currently healthy', stage: 'Workflow', reason: 'No major duration or reliability signal was detected in the fetched run history.', benefit: 'Keep monitoring for regressions as workload changes.', evidence: evidence(recentRuns) })
   return recs
 }
 
@@ -164,9 +180,29 @@ async function routes(req, res) {
     const jobsMatch = pathname.match(/^\/api\/runs\/(\d+)\/jobs$/)
     if (jobsMatch && req.method === 'GET') { const data = await githubRequest(`https://api.github.com/repos/${url.searchParams.get('owner') || ''}/${url.searchParams.get('repo') || ''}/actions/runs/${jobsMatch[1]}/jobs`, token); return json(res, 200, data) }
     const recMatch = pathname.match(/^\/api\/repos\/([^/]+)\/([^/]+)\/recommendations$/)
-    if (recMatch && req.method === 'GET') { const key = `${user.id}:${recMatch[1]}/${recMatch[2]}`; const stored = db.analyses[key]?.runs || []; const generated = recommendationsFrom(stored); const saved = db.recommendations[key] || []; return json(res, 200, { recommendations: generated.map(r => saved.find(s => s.id === r.id) || r) }) }
+    if (recMatch && req.method === 'GET') { const key = `${user.id}:${recMatch[1]}/${recMatch[2]}`; const stored = db.analyses[key]?.runs || []; const generated = recommendationsFrom(stored); const saved = db.recommendations[key] || []; return json(res, 200, { recommendations: generated.map(r => { const previous = saved.find(s => s.id === r.id); return { ...r, ...previous, evidence: r.evidence } }) }) }
     const reviewMatch = pathname.match(/^\/api\/repos\/([^/]+)\/([^/]+)\/recommendations\/([^/]+)\/review$/)
-    if (reviewMatch && req.method === 'POST') { const key = `${user.id}:${reviewMatch[1]}/${reviewMatch[2]}`; const input = await body(req); const existing = db.recommendations[key] || []; db.recommendations[key] = existing.map(r => r.id === reviewMatch[3] ? { ...r, reviewed: input.reviewed !== false, reviewedAt: new Date().toISOString() } : r); saveDb(); return json(res, 200, { ok: true, recommendations: db.recommendations[key] }) }
+    if (reviewMatch && req.method === 'POST') {
+      const key = `${user.id}:${reviewMatch[1]}/${reviewMatch[2]}`
+      const input = await body(req)
+      const generated = recommendationsFrom(db.analyses[key]?.runs || [])
+      const previous = db.recommendations[key] || []
+      if (!generated.some(r => r.id === reviewMatch[3])) return json(res, 404, { error: 'Recommendation not found. Refresh the recommendations and try again.' })
+      db.recommendations[key] = generated.map(r => {
+        const saved = previous.find(item => item.id === r.id)
+        return {
+          ...r,
+          ...saved,
+          evidence: r.evidence,
+          ...(r.id === reviewMatch[3] ? {
+            reviewed: input.reviewed !== false,
+            reviewedAt: input.reviewed === false ? null : new Date().toISOString()
+          } : {})
+        }
+      })
+      saveDb()
+      return json(res, 200, { ok: true, recommendations: db.recommendations[key] })
+    }
     if (pathname === '/api/analyze' && req.method === 'POST') { const input = await body(req); const key = `${user.id}:${input.fullName}`; const stored = db.analyses[key]?.runs || []; const recs = recommendationsFrom(stored); db.recommendations[key] = recs; saveDb(); return json(res, 200, { recommendations: recs, analysis: calculateAnalysis(stored) }) }
 
     return json(res, 404, { error: 'API route not found' })

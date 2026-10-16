@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { NavLink, Route, Routes, useNavigate } from 'react-router-dom'
+import { Navigate, NavLink, Route, Routes } from 'react-router-dom'
 import {
   Activity, AlertTriangle, BarChart3, Bell, CheckCircle2, ChevronDown, CircleHelp,
-  Clock3, GitBranch, Github, LayoutDashboard, Link2, ListChecks, LogOut, Menu,
-  MoreHorizontal, PlayCircle, RefreshCw, Search, Settings, ShieldCheck, SlidersHorizontal,
+  Clock3, GitBranch, Github, LayoutDashboard, ListChecks, LogOut, Menu,
+  MoreHorizontal, PlayCircle, RefreshCw, Search, Settings, SlidersHorizontal,
   User, X, ExternalLink, Square, RotateCcw, Play, Sun, Moon, LogIn, Gauge, ShieldAlert
 } from 'lucide-react'
 
@@ -19,7 +19,6 @@ const nav = [
   { to: '/pipelines', label: 'Pipelines', icon: PlayCircle },
   { to: '/recommendations', label: 'Recommendations', icon: ListChecks },
   { to: '/analytics', label: 'Analytics', icon: BarChart3 },
-  { to: '/integrations', label: 'Integrations', icon: Link2 },
   { to: '/settings', label: 'Settings', icon: Settings }
 ]
 
@@ -73,7 +72,7 @@ function App() {
           <Route path="/pipelines" element={<Pipelines repo={repo} notify={notify} />} />
           <Route path="/recommendations" element={<Recommendations repo={repo} notify={notify} />} />
           <Route path="/analytics" element={<Analytics repo={repo} range={range} setRange={setRange} />} />
-          <Route path="/integrations" element={<Integrations notify={notify} />} />
+          <Route path="/integrations" element={<Navigate to="/" replace />} />
           <Route path="/settings" element={<SettingsPage user={auth.user} notify={notify} />} />
         </Routes>
       </main>
@@ -178,11 +177,154 @@ function PreflightModal({ risk, workflow, repo, onClose, onRun, dispatching }) {
 }
 
 function Recommendations({ repo, notify }) {
-  const [items, setItems] = useState([]); const [loading, setLoading] = useState(true)
-  const load = useCallback(async () => { setLoading(true); try { const data = await api(`/api/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/recommendations`); setItems(data.recommendations) } catch (e) { notify(e.message) } finally { setLoading(false) } }, [repo, notify])
+  const [items, setItems] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [expandedId, setExpandedId] = useState(null)
+  const [reviewingId, setReviewingId] = useState(null)
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const repoPath = `/api/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`
+      const runData = await api(`${repoPath}/actions/runs?per_page=100`)
+      const runs = Array.isArray(runData.runs) ? runData.runs : []
+      const data = await api(`${repoPath}/recommendations`)
+      const completedRuns = runs.filter(run => run.status !== 'running')
+      const failedRuns = completedRuns.filter(run => run.conclusion === 'failure' || run.status === 'failed')
+      const durations = completedRuns.map(run => Number(run.duration) || 0).filter(duration => duration > 0)
+      const averageDuration = durations.length
+        ? Number((durations.reduce((total, duration) => total + duration, 0) / durations.length).toFixed(1))
+        : 0
+      setItems(data.recommendations.map(recommendation => {
+        const sampleRuns = recommendation.id === 'failures'
+          ? failedRuns.slice(0, 3)
+          : recommendation.id === 'duration'
+            ? [...completedRuns].filter(run => Number(run.duration) > 0).sort((a, b) => b.duration - a.duration).slice(0, 3)
+            : runs.slice(0, 3)
+        return {
+          ...recommendation,
+          evidence: {
+            runsAnalyzed: runs.length,
+            completedRuns: completedRuns.length,
+            failedRuns: failedRuns.length,
+            averageDuration,
+            sampleRuns
+          }
+        }
+      }))
+      return true
+    } catch (e) {
+      notify(e.message)
+      return false
+    } finally {
+      setLoading(false)
+    }
+  }, [repo, notify])
   useEffect(() => { load() }, [load])
-  useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('theme', theme) }, [theme])
-  return <><PageTitle eyebrow="OPTIMIZATION" title="Recommendations" description="Suggestions generated from your real GitHub Actions run history." actions={<button className="button button-primary" disabled={loading} onClick={() => { load(); notify('Recommendations recalculated from live data') }}><Activity size={16} /> Recalculate</button>} /><div className="recommendation-layout"><div className="recommendation-list">{items.map(r => <article className="recommendation-card" key={r.id}><div className="recommendation-top"><PriorityBadge value={r.priority} /><span>{r.type}</span></div><h3>{r.title}</h3><div className="affected"><GitBranch size={15} /> Affected stage: <strong>{r.stage}</strong></div><p>{r.reason}</p><div className="benefit"><CheckCircle2 size={16} /><strong>Expected benefit:</strong> {r.benefit}</div><div className="recommendation-actions"><button className="button button-secondary" onClick={() => notify(`Recommendation: ${r.title}`)}>View details</button><button className="button button-primary" onClick={async () => { try { await api(`/api/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/recommendations/${encodeURIComponent(r.id)}/review`, { method: 'POST', body: JSON.stringify({ reviewed: true }) }); setItems(items.map(x => x.id === r.id ? { ...x, reviewed: true } : x)); notify('Recommendation saved for review') } catch (e) { notify(e.message) } }}>{r.reviewed ? 'Reviewed' : 'Mark for review'}</button></div></article>)}{!items.length && <Panel><div className="empty-state">{loading ? 'Analyzing live runs…' : 'No recommendations yet. Refresh the pipeline data first.'}</div></Panel>}</div><Panel title="How recommendations work" subtitle="Evidence-based analysis"><div className="explain-list"><Explain number="01" title="Measure" text="Real GitHub Actions run durations, statuses and branches are collected." /><Explain number="02" title="Detect" text="The backend compares the observed history for duration and reliability signals." /><Explain number="03" title="Recommend" text="Detected issues become reviewable optimization suggestions." /></div></Panel></div></>
+
+  const refreshRecommendations = async () => {
+    if (await load()) notify('Recommendations refreshed from live data')
+  }
+
+  const nextSteps = {
+    duration: [
+      'Open the slowest runs below and compare their job durations.',
+      'Check dependency installation and build steps for reusable caching opportunities.',
+      'Split independent jobs into parallel jobs, then compare the next runs.'
+    ],
+    failures: [
+      'Open a failed run below and inspect the failed job and step logs on GitHub.',
+      'Check whether the failures share a branch, event, or workflow step.',
+      'After addressing the root cause, monitor subsequent runs to confirm reliability improves.'
+    ],
+    healthy: [
+      'Keep monitoring new runs for duration increases or failed executions.',
+      'Review this page again after workflow or dependency changes.'
+    ]
+  }
+
+  return <>
+    <PageTitle
+      eyebrow="OPTIMIZATION"
+      title="Recommendations"
+      description="Suggestions generated from your real GitHub Actions run history."
+      actions={<button className="button button-primary" disabled={loading} onClick={refreshRecommendations}><Activity size={16} /> Refresh</button>}
+    />
+    <div className="recommendation-layout">
+      <div className="recommendation-list">
+        {items.map(r => <article className="recommendation-card" key={r.id}>
+          <div className="recommendation-top"><PriorityBadge value={r.priority} /><span>{r.type}</span></div>
+          <h3>{r.title}</h3>
+          <div className="affected"><GitBranch size={15} /> Affected stage: <strong>{r.stage}</strong></div>
+          <p>{r.reason}</p>
+          <div className="benefit"><CheckCircle2 size={16} /><strong>Expected benefit:</strong> {r.benefit}</div>
+          <div className="recommendation-actions">
+            <button
+              className="button button-secondary"
+              aria-expanded={expandedId === r.id}
+              aria-controls={`recommendation-details-${r.id}`}
+              onClick={() => setExpandedId(current => current === r.id ? null : r.id)}
+            >{expandedId === r.id ? 'Hide details' : 'View details'}</button>
+            <button className="button button-primary" onClick={async () => {
+              const reviewed = !r.reviewed
+              setReviewingId(r.id)
+              try {
+                await api(`/api/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/recommendations/${encodeURIComponent(r.id)}/review`, {
+                  method: 'POST',
+                  body: JSON.stringify({ reviewed })
+                })
+                setItems(current => current.map(item => item.id === r.id ? { ...item, reviewed } : item))
+                notify(reviewed ? 'Recommendation marked as reviewed' : 'Review status cleared')
+              } catch (e) {
+                notify(e.message)
+              } finally {
+                setReviewingId(null)
+              }
+            }} disabled={reviewingId === r.id}>
+              {reviewingId === r.id ? 'Saving…' : r.reviewed ? 'Undo reviewed' : 'Mark for review'}
+            </button>
+          </div>
+          {expandedId === r.id && <section className="recommendation-details" id={`recommendation-details-${r.id}`} aria-label={`${r.title} details`}>
+            <div className="recommendation-details-heading">
+              <div><strong>Why this is recommended</strong><span>Based on the latest fetched GitHub Actions history</span></div>
+              <span className={`recommendation-review-state${r.reviewed ? ' is-reviewed' : ''}`}>{r.reviewed ? 'Reviewed' : 'Needs review'}</span>
+            </div>
+            <div className="recommendation-evidence">
+              <div><span>Runs analyzed</span><strong>{r.evidence?.runsAnalyzed ?? 0}</strong></div>
+              <div><span>Completed runs</span><strong>{r.evidence?.completedRuns ?? 0}</strong></div>
+              <div><span>Failed runs</span><strong>{r.evidence?.failedRuns ?? 0}</strong></div>
+              <div><span>Average duration</span><strong>{r.evidence?.averageDuration ?? 0} min</strong></div>
+            </div>
+            <div className="recommendation-detail-columns">
+              <div>
+                <h4>Suggested next steps</h4>
+                <ol>{(nextSteps[r.id] || nextSteps.healthy).map(step => <li key={step}>{step}</li>)}</ol>
+              </div>
+              <div>
+                <h4>{r.id === 'failures' ? 'Failed runs' : r.id === 'duration' ? 'Slowest runs' : 'Recent runs'}</h4>
+                {r.evidence?.sampleRuns?.length ? <ul className="recommendation-run-list">
+                  {r.evidence.sampleRuns.map(run => <li key={run.id}>
+                    <a href={run.url} target="_blank" rel="noreferrer">
+                      <span><strong>#{run.number} · {run.name}</strong><ExternalLink size={13} /></span>
+                      <small>{run.branch || 'Unknown branch'} · {run.duration} min · {formatTime(run.time)}</small>
+                    </a>
+                    <StatusBadge status={run.status} />
+                  </li>)}
+                </ul> : <p className="recommendation-no-evidence">No individual runs are available in the fetched history yet. Refresh pipeline runs to load current evidence.</p>}
+              </div>
+            </div>
+          </section>}
+        </article>)}
+        {!items.length && <Panel><div className="empty-state">{loading ? 'Analyzing live runs…' : 'No recommendations yet. Refresh the pipeline data first.'}</div></Panel>}
+      </div>
+      <Panel title="How recommendations work" subtitle="Evidence-based analysis">
+        <div className="explain-list">
+          <Explain number="01" title="Measure" text="Real GitHub Actions run durations, statuses and branches are collected." />
+          <Explain number="02" title="Detect" text="The backend compares the observed history for duration and reliability signals." />
+          <Explain number="03" title="Recommend" text="Detected issues become reviewable optimization suggestions." />
+        </div>
+      </Panel>
+    </div>
+  </>
 }
 
 function Analytics({ repo, range, setRange }) {
@@ -190,11 +332,6 @@ function Analytics({ repo, range, setRange }) {
   useEffect(() => { api(`/api/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/actions/runs?per_page=100`).then(setData).catch(() => {}) }, [repo])
   const rangedRuns = filterByRange(data.runs, range); const rangedAnalysis = calculateClientAnalysis(rangedRuns); const chart = chartData(rangedRuns); const stages = deriveStages(rangedRuns)
   return <><PageTitle eyebrow="ANALYTICS" title="Historical analytics" description="Live GitHub Actions performance over the fetched execution history." actions={<select className="select-control" value={range} onChange={e => setRange(e.target.value)}><option>7 days</option><option>30 days</option><option>90 days</option></select>} /><section className="stat-grid"><StatCard label="Avg. duration" value={`${rangedAnalysis.avgDuration || 0} min`} detail="From GitHub runs" icon={Clock3} tone="blue" /><StatCard label="Success rate" value={`${rangedAnalysis.successRate || 0}%`} detail="Completed runs" icon={CheckCircle2} tone="success" /><StatCard label="Failed runs" value={rangedAnalysis.failures || 0} detail="Real GitHub Actions failures" icon={AlertTriangle} tone="warning" /><StatCard label="Runs analyzed" value={rangedAnalysis.runs || 0} detail="Fetched from GitHub" icon={BarChart3} tone="neutral" /></section><Panel title="Average pipeline duration" subtitle={`Live recent runs · ${range}`}><LineChart data={chart.durations} suffix=" min" /></Panel><div className="two-col lower-grid"><Panel title="Run contribution" subtitle="Relative duration of recent runs">{stages.map(s => <div className="bar-row" key={s.name}><div><span>{s.name}</span><strong>{s.share}%</strong></div><div className="wide-bar"><i style={{ width: `${s.share}%` }} /></div></div>)}</Panel><Panel title="Reliability" subtitle="Success rate by recent run"><LineChart data={chart.successes} suffix="%" min={0} max={100} /></Panel></div></>
-}
-
-function Integrations({ notify }) {
-  const providers = [{ name: 'GitHub Actions', description: 'Connected through GitHub OAuth. Repositories, workflow runs and workflow controls use the GitHub API.', connected: true, icon: Github }, { name: 'GitLab CI/CD', description: 'Provider adapter not implemented yet. The dashboard does not fake a connection.', connected: false, icon: GitBranch }, { name: 'Jenkins', description: 'Provider adapter not implemented yet. Add it as a separate integration when needed.', connected: false, icon: Activity }]
-  return <><PageTitle eyebrow="INTEGRATIONS" title="CI/CD connections" description="GitHub is live; other providers are intentionally shown as unavailable until their adapters are implemented." /><div className="integration-grid">{providers.map(p => <div className="integration-card" key={p.name}><div className="integration-icon"><p.icon size={22} /></div><div className="integration-body"><div className="integration-title"><h3>{p.name}</h3>{p.connected && <span className="connected"><CheckCircle2 size={14} /> Connected</span>}</div><p>{p.description}</p><button className={`button ${p.connected ? 'button-secondary' : 'button-primary'}`} onClick={() => notify(p.connected ? 'GitHub OAuth is active for this workspace' : `${p.name} adapter is not available yet`)}>{p.connected ? 'Manage connection' : 'Not available'}</button></div></div>)}</div><div className="security-note"><ShieldCheck size={20} /><div><strong>Integration security</strong><p>GitHub access tokens stay server-side and are never sent to the React client.</p></div></div></>
 }
 
 function SettingsPage({ user, notify }) {
